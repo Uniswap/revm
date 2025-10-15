@@ -217,6 +217,17 @@ pub trait JournalTr {
 
     /// Clear current journal resetting it to initial state and return changes state.
     fn finalize(&mut self) -> Self::State;
+
+    /// Enable persistent warming. Warming persists across transactions for the EVM instance lifetime.
+    fn enable_persistent_warming(&mut self) {}
+
+    /// Disable persistent warming.
+    fn disable_persistent_warming(&mut self) {}
+
+    /// Check if persistent warming is enabled.
+    fn is_persistent_warming_enabled(&self) -> bool {
+        false
+    }
 }
 
 /// Transfer and creation result

@@ -1,5 +1,8 @@
 //! Module containing the [`JournalInner`] that is part of [`crate::Journal`].
-use crate::{entry::SelfdestructionRevertStatus, warm_addresses::WarmAddresses};
+use crate::{
+    entry::SelfdestructionRevertStatus, persistent_warm_cache::PersistentWarmCache,
+    warm_addresses::WarmAddresses,
+};
 
 use super::JournalEntryTr;
 use bytecode::Bytecode;
@@ -55,6 +58,8 @@ pub struct JournalInner<ENTRY> {
     pub spec: SpecId,
     /// Warm addresses containing both coinbase and current precompiles.
     pub warm_addresses: WarmAddresses,
+    /// Persistent warming cache. When enabled, warming persists across transactions.
+    pub persistent_warm_cache: Option<PersistentWarmCache>,
 }
 
 impl<ENTRY: JournalEntryTr> Default for JournalInner<ENTRY> {
@@ -78,7 +83,23 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             depth: 0,
             spec: SpecId::default(),
             warm_addresses: WarmAddresses::new(),
+            persistent_warm_cache: None,
         }
+    }
+
+    /// Enable persistent warming. Warming persists across transactions for the EVM instance lifetime.
+    pub fn enable_persistent_warming(&mut self) {
+        self.persistent_warm_cache = Some(PersistentWarmCache::new());
+    }
+
+    /// Disable persistent warming.
+    pub fn disable_persistent_warming(&mut self) {
+        self.persistent_warm_cache = None;
+    }
+
+    /// Check if persistent warming is enabled.
+    pub fn is_persistent_warming_enabled(&self) -> bool {
+        self.persistent_warm_cache.is_some()
     }
 
     /// Returns the logs
@@ -106,6 +127,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             spec,
             warm_addresses,
+            persistent_warm_cache: _,
         } = self;
         // Spec precompiles and state are not changed. It is always set again execution.
         let _ = spec;
@@ -135,6 +157,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             spec,
             warm_addresses,
+            persistent_warm_cache: _,
         } = self;
         let is_spurious_dragon_enabled = spec.is_enabled_in(SPURIOUS_DRAGON);
         // iterate over all journals entries and revert our global state
@@ -154,6 +177,13 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
     ///
     /// Note: Precompile addresses and spec are preserved and initial state of
     /// warm_preloaded_addresses will contain precompiles addresses.
+    ///
+    /// **Important**: When persistent warming is enabled (via [`enable_persistent_warming`]),
+    /// the persistent warm cache persists across finalize() calls and across all transactions
+    /// in the block. The cache is never explicitly cleared - it lives for the lifetime of
+    /// the EVM instance (which in practice is one block, as a fresh EVM is created per block).
+    ///
+    /// [`enable_persistent_warming`]: Self::enable_persistent_warming
     #[inline]
     pub fn finalize(&mut self) -> EvmState {
         // Clears all field from JournalInner. Doing it this way to avoid
@@ -167,6 +197,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             transaction_id,
             spec,
             warm_addresses,
+            persistent_warm_cache: _,
         } = self;
         // Spec is not changed. And it is always set again in execution.
         let _ = spec;
@@ -182,6 +213,8 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         *depth = 0;
         // reset transaction id.
         *transaction_id = 0;
+
+        // Persistent warm cache is NOT cleared - it persists for the lifetime of the EVM instance.
 
         state
     }
@@ -631,9 +664,17 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
         let load = match self.state.entry(address) {
             Entry::Occupied(entry) => {
                 let account = entry.into_mut();
-                let is_cold = account.mark_warm_with_transaction_id(self.transaction_id);
+                let mut is_cold = account.mark_warm_with_transaction_id(self.transaction_id);
                 // if it is colad loaded we need to clear local flags that can interact with selfdestruct
                 if is_cold {
+                    // account can be loaded but we still need to check warm_addresses and persistent_warm_cache to see if it is cold.
+                    let should_be_cold = if let Some(cache) = &self.persistent_warm_cache {
+                        !cache.is_address_warm(&address) && self.warm_addresses.is_cold(&address)
+                    } else {
+                        self.warm_addresses.is_cold(&address)
+                    };
+                    is_cold = should_be_cold;
+
                     // if it is cold loaded and we have selfdestructed locally it means that
                     // account was selfdestructed in previous transaction and we need to clear its information and storage.
                     if account.is_selfdestructed_locally() {
@@ -642,6 +683,10 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                     }
                     // unmark locally created
                     account.unmark_created_locally();
+                }
+
+                if let Some(cache) = &mut self.persistent_warm_cache {
+                    cache.warm_account_and_storage(address, []);
                 }
                 StateLoad {
                     data: account,
@@ -656,7 +701,15 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                 };
 
                 // Precompiles among some other account(coinbase included) are warm loaded so we need to take that into account
-                let is_cold = self.warm_addresses.is_cold(&address);
+                let is_cold = if let Some(cache) = &self.persistent_warm_cache {
+                    !cache.is_address_warm(&address) && self.warm_addresses.is_cold(&address)
+                } else {
+                    self.warm_addresses.is_cold(&address)
+                };
+
+                if let Some(cache) = &mut self.persistent_warm_cache {
+                    cache.warm_account_and_storage(address, []);
+                }
 
                 StateLoad {
                     data: vac.insert(account),
@@ -689,6 +742,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
                 self.transaction_id,
                 address,
                 storage_key,
+                &mut self.persistent_warm_cache,
             )?;
         }
         Ok(load)
@@ -716,6 +770,7 @@ impl<ENTRY: JournalEntryTr> JournalInner<ENTRY> {
             self.transaction_id,
             address,
             key,
+            &mut self.persistent_warm_cache,
         )
     }
 
@@ -828,15 +883,37 @@ pub fn sload_with_account<DB: Database, ENTRY: JournalEntryTr>(
     transaction_id: usize,
     address: Address,
     key: StorageKey,
+    persistent_warm_cache: &mut Option<PersistentWarmCache>,
 ) -> Result<StateLoad<StorageValue>, DB::Error> {
     let is_newly_created = account.is_created();
     let (value, is_cold) = match account.storage.entry(key) {
         Entry::Occupied(occ) => {
             let slot = occ.into_mut();
-            let is_cold = slot.mark_warm_with_transaction_id(transaction_id);
+            let mut is_cold = slot.mark_warm_with_transaction_id(transaction_id);
+
+            // Check persistent warm cache if slot was cold
+            if is_cold {
+                let should_be_cold = if let Some(cache) = persistent_warm_cache {
+                    !cache.is_storage_warm(&address, &key)
+                } else {
+                    true
+                };
+                is_cold = should_be_cold;
+
+                if let Some(cache) = persistent_warm_cache {
+                    cache.warm_account_and_storage(address, [key]);
+                }
+            }
+
             (slot.present_value, is_cold)
         }
         Entry::Vacant(vac) => {
+            let is_cold = if let Some(cache) = persistent_warm_cache {
+                !cache.is_storage_warm(&address, &key)
+            } else {
+                true
+            };
+
             // if storage was cleared, we don't need to ping db.
             let value = if is_newly_created {
                 StorageValue::ZERO
@@ -846,7 +923,11 @@ pub fn sload_with_account<DB: Database, ENTRY: JournalEntryTr>(
 
             vac.insert(EvmStorageSlot::new(value, transaction_id));
 
-            (value, true)
+            if let Some(cache) = persistent_warm_cache {
+                cache.warm_account_and_storage(address, [key]);
+            }
+
+            (value, is_cold)
         }
     };
 
@@ -856,4 +937,124 @@ pub fn sload_with_account<DB: Database, ENTRY: JournalEntryTr>(
     }
 
     Ok(StateLoad::new(value, is_cold))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::JournalEntry;
+    use database_interface::EmptyDB;
+    use primitives::{address, U256};
+
+    #[test]
+    fn test_persistent_warming_across_transactions() {
+        let mut journal = JournalInner::<JournalEntry>::new();
+        let mut db = EmptyDB::default();
+        let addr = address!("0x1000000000000000000000000000000000000000");
+        let key = U256::from(1);
+
+        // Enable persistent warming
+        journal.enable_persistent_warming();
+
+        // Transaction 1: First access should be cold
+        let load1 = journal.load_account(&mut db, addr).unwrap();
+        assert!(load1.is_cold, "First account load should be cold");
+
+        // Commit transaction 1
+        journal.commit_tx();
+
+        // Transaction 2: Second access should be WARM (persistent warming)
+        let load2 = journal.load_account(&mut db, addr).unwrap();
+        assert!(!load2.is_cold, "Second account load should be warm with persistent warming");
+
+        // Test storage warming across transactions
+        let sload1 = journal.sload(&mut db, addr, key).unwrap();
+        assert!(sload1.is_cold, "First storage load should be cold");
+
+        journal.commit_tx();
+
+        // Transaction 3: Storage should be warm
+        let sload2 = journal.sload(&mut db, addr, key).unwrap();
+        assert!(!sload2.is_cold, "Second storage load should be warm with persistent warming");
+    }
+
+    #[test]
+    fn test_persistent_warming_disabled() {
+        let mut journal = JournalInner::<JournalEntry>::new();
+        let mut db = EmptyDB::default();
+        let addr = address!("0x2000000000000000000000000000000000000000");
+
+        // Without enabling persistent warming, each transaction should be cold
+        let load1 = journal.load_account(&mut db, addr).unwrap();
+        assert!(load1.is_cold, "First load should be cold");
+
+        journal.commit_tx();
+
+        let load2 = journal.load_account(&mut db, addr).unwrap();
+        assert!(load2.is_cold, "Second load should be cold without persistent warming");
+    }
+
+    #[test]
+    fn test_persistent_warming_is_cold_flag_behavior() {
+        // This test verifies that the journal correctly sets the is_cold flag
+        // that the interpreter uses for gas calculation.
+        //
+        // The actual gas costs are calculated in the interpreter layer:
+        // - crates/interpreter/src/instructions/macros.rs (berlin_load_account!)
+        // - crates/interpreter/src/instructions/host.rs (sload)
+        //
+        // This test ensures the journal provides the correct is_cold flag
+        // that those gas calculation functions rely on.
+
+        let mut journal = JournalInner::<JournalEntry>::new();
+        let mut db = EmptyDB::default();
+        let addr = address!("0x4000000000000000000000000000000000000000");
+        let storage_key = U256::from(42);
+
+        // WITHOUT persistent warming: Each transaction sees COLD access
+        {
+            let mut j = journal.clone();
+
+            // Tx 1: First access is COLD
+            let load1 = j.load_account(&mut db, addr).unwrap();
+            assert!(load1.is_cold, "First account access should be COLD");
+
+            let sload1 = j.sload(&mut db, addr, storage_key).unwrap();
+            assert!(sload1.is_cold, "First storage access should be COLD");
+
+            j.commit_tx();
+
+            // Tx 2: Still COLD (no persistent warming)
+            let load2 = j.load_account(&mut db, addr).unwrap();
+            assert!(load2.is_cold, "Second account access should be COLD without persistent warming");
+
+            let sload2 = j.sload(&mut db, addr, storage_key).unwrap();
+            assert!(sload2.is_cold, "Second storage access should be COLD without persistent warming");
+        }
+
+        // WITH persistent warming: First tx COLD, subsequent txs WARM
+        {
+            journal.enable_persistent_warming();
+
+            // Tx 1: First access is COLD
+            let load1 = journal.load_account(&mut db, addr).unwrap();
+            assert!(load1.is_cold, "First account access should be COLD");
+
+            let sload1 = journal.sload(&mut db, addr, storage_key).unwrap();
+            assert!(sload1.is_cold, "First storage access should be COLD");
+
+            journal.commit_tx();
+
+            // Tx 2: Now WARM (persistent warming enabled)
+            let load2 = journal.load_account(&mut db, addr).unwrap();
+            assert!(!load2.is_cold, "Second account access should be WARM with persistent warming");
+
+            let sload2 = journal.sload(&mut db, addr, storage_key).unwrap();
+            assert!(!sload2.is_cold, "Second storage access should be WARM with persistent warming");
+
+            // The interpreter will use these is_cold=false flags to charge:
+            // - Account: WARM_STORAGE_READ_COST (100 gas) instead of COLD_ACCOUNT_ACCESS_COST (2600 gas)
+            // - Storage: WARM_STORAGE_READ_COST (100 gas) instead of COLD_SLOAD_COST (2100 gas)
+        }
+    }
 }
